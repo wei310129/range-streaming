@@ -536,8 +536,12 @@ async function startDownload() {
         // signal 讓此 fetch 受 AbortController 控制，可隨時中止
         res = await fetch(url, { signal: S.abort.signal });
     } catch (e) {
-        // AbortError 是我們自己觸發的（模擬中斷），不算真實錯誤
-        if (e.name !== 'AbortError') handleError(e);
+        // 可能在進入 readStream 前就被中止（例如「開始下載」後立刻按中止）。
+        if (e.name === 'AbortError') {
+            finalizeAbortInterruption(S.file?.size || 0);
+        } else {
+            handleError(e);
+        }
         return;
     }
 
@@ -601,7 +605,12 @@ async function resumeDownload() {
             signal: S.abort.signal,
         });
     } catch (e) {
-        if (e.name !== 'AbortError') handleError(e);
+        // 續傳請求尚未拿到 response 前被中止，也要正確收斂到 interrupted UI。
+        if (e.name === 'AbortError') {
+            finalizeAbortInterruption(S.file?.size || 0);
+        } else {
+            handleError(e);
+        }
         return;
     }
 
@@ -799,6 +808,15 @@ function handleError(e) {
     setBadge('interrupted', '✕ 錯誤', e.message);
     showButtons({ reset: true });
     log('warn', `錯誤`, e.message);
+}
+
+// 將 fetch 階段的中止統一收斂成 interrupted 狀態，避免漏掉續傳按鈕顯示。
+function finalizeAbortInterruption(totalHint) {
+    if (S.phase !== 'interrupted') {
+        S.phase = 'interrupted';
+    }
+    const total = totalHint || (S.file ? S.file.size : 0) || Math.max(S.received, 1);
+    onInterrupted(total);
 }
 
 // ─────────────────────────────────────────────────────────
