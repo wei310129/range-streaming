@@ -399,9 +399,45 @@ const S = {
     speed:       0,      // 目前計算出的下載速度（bytes/sec）
 };
 
-// ────────────────────────────────────────────────────────────
-// File list
-// ────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// 【重要】斷點續傳是真實行為，不是 UI 假象
+// ════════════════════════════════════════════════════════════
+//
+// 常見疑問：進度條從中間繼續增長，是不是只是把數字往前加，
+//           實際上還是從頭重新下載？
+//
+// 答：不是。這是真實的 HTTP Range Request，伺服器只傳送剩餘的 bytes。
+//
+// 驗證方式（開啟 DevTools → Network tab）：
+//   第一次請求：
+//     Request  Headers: 無 Range
+//     Response Headers: 200 OK, Content-Length: 10,485,760（完整大小）
+//     Transferred:      ~4.2 MB（中斷時已收到的量）
+//
+//   續傳請求：
+//     Request  Headers: Range: bytes=4300000-          ← 只請求剩餘部分
+//     Response Headers: 206 Partial Content
+//                       Content-Range: bytes 4300000-10485759/10485760
+//                       Content-Length: 6,185,760       ← 只有剩餘的量
+//     Transferred:      ~6.2 MB（剩餘部分，兩次加總 ≈ 完整大小）
+//
+// 記憶體中的資料結構：
+//   S.chunks = [
+//     Uint8Array(bytes 0 ~ 4,299,999),   ← 第一次下載存入
+//     Uint8Array(bytes 4,300,000 ~ ...),  ← 續傳存入（接續在同一個陣列）
+//   ]
+//   最後 new Blob(S.chunks) 將兩段合併成完整檔案。
+// ════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────
+// 檔案列表
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 頁面載入時呼叫，向 API Server 取得 file-storage/ 內的 PDF 清單。
+ * 回傳格式：[{ name: "file.pdf", size: 1234567 }, ...]
+ * size 之後用來計算進度百分比與 Range 起訖位置。
+ */
 async function loadFiles() {
     try {
         const files = await fetch('/api/files').then(r => r.json());
@@ -410,6 +446,7 @@ async function loadFiles() {
             el.innerHTML = `<div class="no-files">沒有 PDF 檔案<br>請放入 <code>file-storage/</code></div>`;
             return;
         }
+        // 將 size 寫進 onclick 參數，selectFile 不需要再打 API 查詢大小
         el.innerHTML = files.map(f =>
             `<div class="file-item" id="fi-${CSS.escape(f.name)}" onclick="selectFile('${f.name}',${f.size})">
                 <span class="f-name">${f.name}</span>
@@ -422,11 +459,17 @@ async function loadFiles() {
     }
 }
 
+/**
+ * 使用者點擊左側檔案列表時呼叫。
+ * 將選擇的檔案資訊存入狀態，並重置所有進度 UI。
+ * 下載進行中時點擊其他檔案無效（避免狀態混亂）。
+ */
 function selectFile(name, size) {
+    // 下載或續傳進行中時禁止切換檔案（S.chunks 還有未完成的資料）
     if (S.phase === 'downloading' || S.phase === 'resuming') return;
 
     S.file = { name, size };
-    resetState();
+    resetState();  // 清除上一次的 chunks 和進度
 
     document.querySelectorAll('.file-item').forEach(e => e.classList.remove('active'));
     document.getElementById('fi-' + CSS.escape(name))?.classList.add('active');
@@ -444,18 +487,35 @@ function selectFile(name, size) {
     log('info', `選擇 ${name}`, fmt(size));
 }
 
-// ────────────────────────────────────────────────────────────
-// Download flow
-// ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// 下載流程
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 第一段下載：不帶 Range header，從 byte 0 開始。
+ *
+ * 流程：
+ *   1. 建立 AbortController（用於之後模擬中斷）
+ *   2. fetch() 取得 response，確認回應正常（200 OK）
+ *   3. 從 response.body 取得 ReadableStream reader
+ *   4. 進入 readStream() 逐 chunk 讀取
+ *   5. readStream() 在 interruptAt 處呼叫 abort() 中斷
+ */
 async function startDownload() {
     if (!S.file) return;
 
     resetState();
-    S.phase       = 'downloading';
+    S.phase = 'downloading';
+
+    // 【僅 Demo 用】隨機設定模擬中斷點在 25%～65% 之間
+    // 真實場景不需要這行；中斷由網路問題觸發，不是人為設定
     S.interruptAt = Math.floor(S.file.size * (0.25 + Math.random() * 0.4));
-    S.abort       = new AbortController();
-    S.speedTs     = Date.now();
-    S.speedBytes  = 0;
+
+    // AbortController：可在任意時刻中止 fetch
+    // 呼叫 S.abort.abort() → fetch 拋出 AbortError → catch 攔截 → 進入中斷狀態
+    S.abort      = new AbortController();
+    S.speedTs    = Date.now();
+    S.speedBytes = 0;
 
     showButtons({ cancel: true });
     setBadge('downloading', '下載中', '');
@@ -466,8 +526,11 @@ async function startDownload() {
 
     let res;
     try {
+        // 不帶 Range → 伺服器回傳 200 + 完整檔案
+        // signal 讓此 fetch 受 AbortController 控制，可隨時中止
         res = await fetch(url, { signal: S.abort.signal });
     } catch (e) {
+        // AbortError 是我們自己觸發的（模擬中斷），不算真實錯誤
         if (e.name !== 'AbortError') handleError(e);
         return;
     }
@@ -477,18 +540,40 @@ async function startDownload() {
         return;
     }
 
+    // Content-Length 是完整檔案大小，用於計算進度百分比
+    // 若 server 未回傳此 header，fallback 到 file-list API 的值
     const total = parseInt(res.headers.get('Content-Length')) || S.file.size;
     log('200', `200 OK`,
         `Content-Length: ${fmt(total)} · Accept-Ranges: ${res.headers.get('Accept-Ranges') || '?'}`);
 
+    // 將 ReadableStream reader 傳給核心迴圈，isResume=false 啟用模擬中斷邏輯
     await readStream(res.body.getReader(), total, false);
 }
 
+/**
+ * 續傳：帶 Range header，只請求尚未收到的部分。
+ *
+ * ★ 這裡是斷點續傳的關鍵，不是 UI 假象：
+ *   - S.received 是第一段實際收到的 bytes 數（已存在 S.chunks 裡）
+ *   - Range: bytes=S.received- 告訴伺服器「只給我從這個位置開始的資料」
+ *   - 伺服器回傳 206，Content-Length 是「剩餘」大小，不是完整大小
+ *   - 新收到的 chunks 直接 push 進同一個 S.chunks 陣列（接在第一段後面）
+ *   - 兩段加起來才是完整檔案，沒有任何重複傳輸
+ *
+ * 可在 DevTools Network tab 確認：
+ *   續傳請求的 Response Headers 有 Content-Range: bytes X-Y/Total
+ *   且 Content-Length 只有剩餘部分的大小（不是整個檔案）
+ */
 async function resumeDownload() {
     if (S.phase !== 'interrupted') return;
 
-    S.phase      = 'resuming';
+    S.phase = 'resuming';
+
+    // 記錄本段續傳的起點（= 中斷時已收到的量）
+    // 用途：進度條要在此位置開始畫綠色區塊（區分「初次」和「續傳」兩段）
     S.resumeFrom = S.received;
+
+    // 建立新的 AbortController（舊的已 abort，不能重用）
     S.abort      = new AbortController();
     S.speedTs    = Date.now();
     S.speedBytes = 0;
@@ -496,6 +581,9 @@ async function resumeDownload() {
     showButtons({ cancel: true });
     setBadge('resuming', '續傳中', `從 ${fmt(S.received)} 繼續`);
 
+    // ★ Range header 格式：bytes=起點-（省略終點 = 取到 EOF）
+    // 例如已收到 4,300,000 bytes，就帶 Range: bytes=4300000-
+    // 伺服器只傳送 byte 4,300,000 之後的資料，不重傳已下載的部分
     const rangeVal = `bytes=${S.received}-`;
     const url = `/api/pdf/${encodeURIComponent(S.file.name)}`;
     log('req', `GET ${url}`, `Range: ${rangeVal}`);
@@ -511,52 +599,88 @@ async function resumeDownload() {
         return;
     }
 
+    // 伺服器支援 Range Request → 必須回 206 Partial Content
+    // 若回 200 代表伺服器忽略了 Range header，整個檔案又從頭傳，視為異常
     if (res.status !== 206) {
         handleError(new Error(`HTTP ${res.status}：預期 206 Partial Content`));
         return;
     }
 
+    // Content-Range: bytes 4300000-10485759/10485760 → 確認伺服器真的從斷點開始傳
+    // Content-Length: 6185760                        → 只有剩餘部分的大小，驗證沒有重複傳輸
     const contentRange = res.headers.get('Content-Range') || '—';
     const contentLen   = res.headers.get('Content-Length') || '—';
     log('206', `206 Partial Content`,
         `Content-Range: ${contentRange} · Length: ${contentLen}`);
 
+    // isResume=true：readStream 不會再模擬中斷
+    // total 傳入「完整檔案大小」（不是本次 Content-Length），才能正確顯示整體進度
     await readStream(res.body.getReader(), S.file.size, true);
 }
 
-// Core streaming loop
+/**
+ * 串流讀取核心迴圈。
+ *
+ * fetch() 的 response.body 是 ReadableStream，不需等整個檔案下載完畢，
+ * 可以邊收邊處理，也可以在任意 chunk 邊界主動中斷。
+ *
+ * reader.read() 每次 await 後回傳一個 chunk：
+ *   { done: false, value: Uint8Array(N) }  → 收到 N bytes 的資料片段
+ *   { done: true,  value: undefined }      → 串流正常結束
+ *
+ * 初次下載和續傳都走同一個迴圈，差別只在 isResume 是否啟用模擬中斷。
+ *
+ * @param reader    fetch response.body.getReader()
+ * @param total     檔案總大小（bytes），用於百分比計算
+ * @param isResume  true = 續傳模式，不模擬中斷
+ */
 async function readStream(reader, total, isResume) {
     try {
         while (true) {
+            // await 在這裡暫停，等待下一個網路封包到達，不佔用 CPU
             const { done, value } = await reader.read();
 
-            if (done) break;  // 正常結束，跳出後再判斷是否真正完成
+            // done=true：串流結束（正常完成 或 被 abort 後 stream 關閉）
+            // 跳出後再根據 S.phase 和 S.received 判斷是真正完成還是意外中斷
+            if (done) break;
 
+            // ★ chunk 存入陣列
+            // S.chunks 在整個下載過程（含續傳）共用同一個陣列
+            // 第一段存 index 0~N，續傳段接著存 N+1~M，順序連續、無間隙
             S.chunks.push(value);
-            S.received += value.length;
+            S.received += value.length;  // 累計已收到的總 bytes（跨兩段請求）
             updateSpeed(value.length);
             renderProgress(total);
 
-            // 模擬中斷：先設 phase，再 abort，最後 break
+            // ★ 模擬中斷（僅 Demo 用，isResume=false 時才執行）
+            // 注意操作順序非常重要：
+            //   1. 先設 S.phase = 'interrupted'
+            //   2. 再呼叫 S.abort.abort()（中斷 fetch）
+            //   3. 最後 break 跳出迴圈
+            // 若先 abort() 再設 phase，catch 攔截 AbortError 時 phase 還是
+            // 'downloading'，catch 裡會再設一次，邏輯混亂且難以追蹤
             if (!isResume && S.phase === 'downloading' && S.received >= S.interruptAt) {
                 S.phase = 'interrupted';
-                S.abort.abort();  // 關閉底層連線
+                S.abort.abort();  // 關閉底層 TCP 連線，停止接收後續資料
                 break;
             }
         }
     } catch (e) {
-        // abort() 觸發的 AbortError，或其他意外錯誤
+        // S.abort.abort() 或使用者點「中止」都會觸發 AbortError
+        // 其他網路錯誤也統一視為中斷（讓使用者可以從目前位置續傳重試）
         if (S.phase === 'downloading' || S.phase === 'resuming') {
             S.phase = 'interrupted';
         }
     }
 
+    // ── 迴圈結束後判斷結果 ──
     if (S.phase === 'interrupted') {
         onInterrupted(total);
+
     } else if (S.phase === 'downloading' || S.phase === 'resuming') {
-        // done=true 跳出迴圈：確認實際收到的量是否符合預期
+        // done=true 自然跳出：確認收到量是否符合預期（允許 1% 誤差）
+        // 若遠少於預期，代表伺服器回傳了錯誤頁面或連線被切斷，視為中斷可重試
         if (total > 0 && S.received < total * 0.99) {
-            // 串流提前結束（伺服器錯誤或連線問題）
             S.phase = 'interrupted';
             onInterrupted(total);
         } else {
@@ -566,85 +690,134 @@ async function readStream(reader, total, isResume) {
     }
 }
 
+/**
+ * 進入中斷狀態的 UI 處理。
+ * 顯示已收到的 bytes 數並出現「從斷點續傳」按鈕。
+ * S.chunks 裡的資料在此時仍然保留，不清除，等待後續合併使用。
+ */
 function onInterrupted(total) {
     const pct = (S.received / total * 100).toFixed(1);
     showButtons({ resume: true, reset: true });
     setBadge('interrupted', '⚡ 中斷！', `已接收 ${fmt(S.received)} (${pct}%)，待續傳 ${fmt(total - S.received)}`);
     log('warn', `下載中斷`,
-        `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，將從此處續傳`);
+        `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，S.chunks 保留中，可從此處續傳`);
 }
 
+/**
+ * 下載完成：合併所有 chunks 並觸發瀏覽器存檔。
+ *
+ * ★ new Blob(S.chunks) 是合併兩段資料的關鍵：
+ *   S.chunks = [ ...第一段的 Uint8Array[], ...第二段的 Uint8Array[] ]
+ *   Blob 建構子接受陣列，依序串接成連續的二進位資料。
+ *   結果與一次性完整下載完全相同，不會有資料缺口或重複。
+ *
+ * createObjectURL(blob) 在記憶體中產生臨時的 blob:// URL，
+ * 用 <a download> 模擬點擊觸發瀏覽器「另存新檔」對話框。
+ */
 function onComplete() {
     renderProgress(S.file.size);
     setBadge('done', '✓ 完成', `共 ${fmt(S.received)}，儲存中...`);
     showButtons({ reset: true });
 
+    // 合併：第一段（bytes 0~X）+ 續傳段（bytes X~EOF）= 完整檔案
     const blob = new Blob(S.chunks, { type: 'application/pdf' });
+
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = S.file.name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    // 注意：不能立即 revokeObjectURL，瀏覽器需要一點時間讀取 blob
 
     log('ok', `✓ 下載完成`,
         `${fmt(blob.size)} · 由 ${S.resumeFrom ? '2' : '1'} 段請求組成`);
     if (S.resumeFrom) {
+        // 印出兩段各自的 byte 範圍，驗證無重疊、無間隙
         log('info',
             `初次: bytes 0–${(S.resumeFrom - 1).toLocaleString()} `,
             `續傳: bytes ${S.resumeFrom.toLocaleString()}–${(S.received - 1).toLocaleString()}`);
     }
 }
 
+/**
+ * 使用者點「中止」按鈕。
+ * 先設 phase 再 abort，確保 catch 攔截時看到正確的 phase 值。
+ * 中止後 S.chunks 保留，使用者仍可點「從斷點續傳」繼續。
+ */
 function cancelDownload() {
-    S.phase = 'interrupted';  // 先設 phase，catch 才能正確判斷
+    S.phase = 'interrupted';
     S.abort?.abort();
 }
 
+/**
+ * 顯示錯誤狀態（非 AbortError 的真實錯誤，或伺服器回傳非預期狀態碼）。
+ */
 function handleError(e) {
     setBadge('interrupted', '✕ 錯誤', e.message);
     showButtons({ reset: true });
     log('warn', `錯誤`, e.message);
 }
 
-// ────────────────────────────────────────────────────────────
-// UI helpers
-// ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// UI 工具函式
+// ─────────────────────────────────────────────────────────
+
+/**
+ * 更新進度條的視覺呈現。
+ *
+ * 進度條由兩個顏色區塊疊加（CSS position: absolute）：
+ *   藍色（seg-initial）：第一段下載的範圍，寬度 = resumeFrom / total
+ *   綠色（seg-resumed）：續傳段的範圍，從 resumeFrom 的 x 位置開始往右延伸
+ *
+ * 續傳開始前（resumeFrom=0）只有藍色在增長。
+ * 續傳開始後藍色寬度凍結，改由綠色從斷點處繼續延伸。
+ * 兩色清楚區分「哪段是初次傳的，哪段是續傳的」。
+ */
 function renderProgress(total) {
     const pct = total > 0 ? S.received / total * 100 : 0;
 
     if (S.resumeFrom === 0) {
-        // Initial download — grow the blue bar
+        // 第一段下載中：只移動藍色區塊
         document.getElementById('seg-initial').style.width = pct + '%';
     } else {
-        // Resumed — blue bar stays frozen, green bar grows from resumeFrom
-        const resumePct    = S.resumeFrom / total * 100;
-        const resumedWidth = (S.received - S.resumeFrom) / total * 100;
+        // 續傳中：藍色凍結在斷點，綠色從斷點開始增長
+        const resumePct    = S.resumeFrom / total * 100;                    // 斷點的 x 位置（%）
+        const resumedWidth = (S.received - S.resumeFrom) / total * 100;     // 綠色的寬度（%）
         document.getElementById('seg-initial').style.width = resumePct + '%';
         const seg = document.getElementById('seg-resumed');
-        seg.style.setProperty('--resume-left', resumePct + '%');
+        seg.style.setProperty('--resume-left', resumePct + '%');            // CSS 變數：綠色起點
         seg.style.width = resumedWidth + '%';
     }
 
     document.getElementById('prog-pct').textContent = pct.toFixed(1) + '%';
-    document.getElementById('prog-received').textContent =
-        `${fmt(S.received)} / ${fmt(total)}`;
+    document.getElementById('prog-received').textContent = `${fmt(S.received)} / ${fmt(total)}`;
     if (S.speed > 0) {
         document.getElementById('prog-speed').textContent = fmt(S.speed) + '/s';
     }
 }
 
+/**
+ * 估算目前下載速度，每 300ms 更新一次。
+ * 計算公式：speed = 這段時間收到的 bytes ÷ 經過毫秒數 × 1000
+ * 設定 300ms 間隔避免每個 chunk 都觸發 DOM 更新而影響效能。
+ */
 function updateSpeed(bytes) {
     S.speedBytes += bytes;
     const now = Date.now();
     const elapsed = now - S.speedTs;
     if (elapsed >= 300) {
-        S.speed     = Math.round(S.speedBytes / elapsed * 1000);
-        S.speedTs   = now;
+        S.speed      = Math.round(S.speedBytes / elapsed * 1000);
+        S.speedTs    = now;
         S.speedBytes = 0;
     }
 }
 
+/**
+ * 更新狀態徽章的文字與 CSS class（控制顏色和動畫）。
+ * badge-downloading：藍色脈動  badge-interrupted：紅色抖動
+ * badge-resuming：綠色脈動     badge-done：綠色靜止
+ */
 function setBadge(phase, label, detail) {
     const badge = document.getElementById('status-badge');
     badge.className = `badge badge-${phase}`;
