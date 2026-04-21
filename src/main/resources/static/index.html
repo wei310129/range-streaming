@@ -358,20 +358,45 @@
 </div>
 
 <script>
-// ────────────────────────────────────────────────────────────
-// State
-// ────────────────────────────────────────────────────────────
+/*
+ * ══════════════════════════════════════════════════════════════
+ *  斷點續傳（Resumable Download）實作原理
+ * ══════════════════════════════════════════════════════════════
+ *
+ *  HTTP Range Request 是瀏覽器與伺服器之間用來「只取檔案某段」的機制：
+ *
+ *    第一次下載（一般請求）：
+ *      Request:  GET /api/pdf/file.pdf
+ *      Response: 200 OK, Content-Length: 10240, body: [0 ~ 10239 bytes]
+ *
+ *    中斷後續傳（Range 請求）：
+ *      Request:  GET /api/pdf/file.pdf
+ *                Range: bytes=4096-          ← 從第 4096 byte 開始，不指定結尾表示取到最後
+ *      Response: 206 Partial Content
+ *                Content-Range: bytes 4096-10239/10240   ← 本次範圍 / 總大小
+ *                Content-Length: 6144                    ← 本次回傳的 byte 數
+ *                body: [4096 ~ 10239 bytes]
+ *
+ *  前端流程：
+ *    1. fetch() 不帶 Range → 用 ReadableStream 逐 chunk 接收
+ *    2. 模擬中斷 → 停止讀取，記住已收到的 byte 數（S.received）
+ *    3. fetch() 帶 Range: bytes=S.received- → 從斷點繼續接收
+ *    4. 將兩次的 chunks 合併為一個 Blob → 觸發瀏覽器存檔
+ */
+
+// 下載狀態機
+// phase 轉換：idle → downloading → interrupted → resuming → done
 const S = {
-    file:        null,    // { name, size }
-    chunks:      [],      // Uint8Array[]
-    received:    0,       // bytes received so far
-    resumeFrom:  0,       // byte offset where resume started
-    interruptAt: 0,       // simulated interruption byte
-    phase:       'idle',  // idle | downloading | interrupted | resuming | done
-    abort:       null,    // AbortController
-    speedTs:     0,
-    speedBytes:  0,
-    speed:       0,
+    file:        null,   // 當前選擇的檔案 { name, size }
+    chunks:      [],     // 所有已收到的資料片段（Uint8Array[]），兩段請求共用此陣列
+    received:    0,      // 目前累計收到的 bytes 數（同時也是續傳時的斷點位置）
+    resumeFrom:  0,      // 記錄第二段請求的起點，用於進度條顯示「初次/續傳」兩色區塊
+    interruptAt: 0,      // 【模擬用】預設在此 byte 數觸發中斷
+    phase:       'idle', // 狀態機：idle | downloading | interrupted | resuming | done
+    abort:       null,   // AbortController 實例，用來主動中止 fetch 連線
+    speedTs:     0,      // 速度計算用：上次更新的時間戳
+    speedBytes:  0,      // 速度計算用：上次更新後累計的 bytes
+    speed:       0,      // 目前計算出的下載速度（bytes/sec）
 };
 
 // ────────────────────────────────────────────────────────────
