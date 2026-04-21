@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>斷點續傳 Demo</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f1117;
+            color: #e2e8f0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        header {
+            padding: 12px 20px;
+            background: #161b27;
+            border-bottom: 1px solid #2d3748;
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        header h1 { font-size: 1rem; color: #63b3ed; }
+        header p  { font-size: 0.75rem; color: #4a5568; }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 260px 1fr;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* ── Left: file list ── */
+        .files-panel {
+            border-right: 1px solid #2d3748;
+            background: #161b27;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .panel-title {
+            padding: 10px 14px 8px;
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: .1em;
+            color: #4a5568;
+            border-bottom: 1px solid #1a202c;
+        }
+        .file-scroll { overflow-y: auto; flex: 1; padding: 6px; }
+        .file-item {
+            padding: 8px 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            margin-bottom: 3px;
+            border: 1px solid transparent;
+            transition: background 0.1s, border-color 0.1s;
+        }
+        .file-item:hover { background: #1e2535; }
+        .file-item.active { background: #1a2e4a; border-color: #2b4c7e; }
+        .file-item .f-name { font-size: 0.82rem; color: #e2e8f0; word-break: break-all; }
+        .file-item .f-size { font-size: 0.7rem; color: #4a5568; }
+        .no-files { padding: 20px 10px; text-align: center; font-size: 0.78rem; color: #4a5568; line-height: 1.8; }
+        .no-files code { color: #63b3ed; }
+
+        /* ── Right: main area ── */
+        .main-panel {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Selected file info */
+        .file-header {
+            padding: 12px 20px;
+            background: #161b27;
+            border-bottom: 1px solid #2d3748;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        .file-header .fh-icon { font-size: 1.4rem; }
+        .file-header .fh-name { font-size: 0.9rem; font-weight: 600; color: #e2e8f0; }
+        .file-header .fh-size { font-size: 0.75rem; color: #718096; margin-top: 1px; }
+        .fh-placeholder { color: #4a5568; font-size: 0.85rem; }
+
+        /* Download area */
+        .download-area {
+            padding: 24px 24px 16px;
+            border-bottom: 1px solid #2d3748;
+            flex-shrink: 0;
+        }
+
+        /* Progress track */
+        .progress-track {
+            height: 28px;
+            background: #1a202c;
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+            border: 1px solid #2d3748;
+            margin-bottom: 10px;
+        }
+        .prog-seg {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            transition: width 0.15s linear;
+        }
+        .prog-seg.initial { background: linear-gradient(90deg, #2b6cb0, #3182ce); }
+        .prog-seg.resumed { background: linear-gradient(90deg, #276749, #38a169); left: var(--resume-left); }
+        .prog-track-label {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: rgba(255,255,255,0.7);
+            pointer-events: none;
+        }
+
+        /* Progress numbers */
+        .progress-numbers {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+            font-size: 0.78rem;
+        }
+        .prog-received { color: #63b3ed; font-family: monospace; }
+        .prog-speed    { color: #718096; font-family: monospace; }
+        .prog-total    { color: #4a5568; font-family: monospace; }
+
+        /* Status badge */
+        .status-line {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+            min-height: 28px;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .badge-idle         { background: #2d3748; color: #a0aec0; }
+        .badge-downloading  { background: #1a365d; color: #63b3ed; animation: pulse-blue 1.5s infinite; }
+        .badge-interrupted  { background: #742a2a; color: #fc8181; animation: shake 0.4s ease; }
+        .badge-resuming     { background: #1c4532; color: #68d391; animation: pulse-green 1.5s infinite; }
+        .badge-done         { background: #1c4532; color: #68d391; }
+
+        @keyframes pulse-blue  { 0%,100%{opacity:1} 50%{opacity:.6} }
+        @keyframes pulse-green { 0%,100%{opacity:1} 50%{opacity:.7} }
+        @keyframes shake {
+            0%,100%{transform:translateX(0)}
+            20%{transform:translateX(-6px)}
+            40%{transform:translateX(6px)}
+            60%{transform:translateX(-4px)}
+            80%{transform:translateX(4px)}
+        }
+
+        .status-detail { font-size: 0.78rem; color: #718096; }
+        .status-detail.highlight { color: #f6ad55; font-weight: 600; }
+
+        /* Buttons */
+        .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .btn {
+            padding: 7px 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.82rem;
+            font-weight: 600;
+            transition: opacity 0.1s, transform 0.1s;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn:disabled { opacity: 0.35; cursor: default; transform: none; }
+        .btn-download { background: #3182ce; color: white; }
+        .btn-download:hover:not(:disabled) { background: #2b6cb0; }
+        .btn-resume   { background: #276749; color: #9ae6b4; }
+        .btn-resume:hover:not(:disabled)   { background: #22543d; }
+        .btn-cancel   { background: #2d3748; color: #a0aec0; }
+        .btn-cancel:hover:not(:disabled)   { background: #4a5568; }
+        .btn-reset    { background: #2d3748; color: #718096; }
+        .btn-reset:hover:not(:disabled)    { background: #4a5568; }
+
+        /* Legend */
+        .legend {
+            display: flex;
+            gap: 14px;
+            margin-top: 10px;
+            font-size: 0.68rem;
+            color: #4a5568;
+        }
+        .legend-dot {
+            width: 8px; height: 8px;
+            border-radius: 2px;
+            display: inline-block;
+            margin-right: 4px;
+        }
+
+        /* Log */
+        .log-area {
+            flex: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            padding: 12px 20px;
+        }
+        .log-title {
+            font-size: 0.65rem;
+            text-transform: uppercase;
+            letter-spacing: .1em;
+            color: #4a5568;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .log-clear {
+            font-size: 0.65rem;
+            padding: 2px 7px;
+            background: #2d3748;
+            color: #718096;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .log-clear:hover { color: #a0aec0; }
+        .log-box {
+            flex: 1;
+            overflow-y: auto;
+            background: #0d1117;
+            border: 1px solid #1e2535;
+            border-radius: 5px;
+            padding: 8px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.72rem;
+            line-height: 1.5;
+        }
+        .le {
+            padding: 3px 8px;
+            border-radius: 3px;
+            margin-bottom: 2px;
+            border-left: 3px solid transparent;
+        }
+        .le-req  { border-color: #3182ce; }
+        .le-206  { border-color: #38a169; background: #1c453211; }
+        .le-200  { border-color: #4299e1; }
+        .le-warn { border-color: #e53e3e; background: #742a2a11; }
+        .le-ok   { border-color: #38a169; background: #1c453222; }
+        .le-info { border-color: #805ad5; }
+
+        .t-time  { color: #2d3748; }
+        .t-req   { color: #4299e1; }
+        .t-200   { color: #63b3ed; font-weight:700; }
+        .t-206   { color: #68d391; font-weight:700; }
+        .t-warn  { color: #fc8181; font-weight:700; }
+        .t-ok    { color: #68d391; font-weight:700; }
+        .t-range { color: #f6ad55; }
+        .t-dim   { color: #4a5568; }
+        .t-info  { color: #b794f4; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>斷點續傳 Demo</h1>
+    <p>模擬下載中斷後，前端自動偵測並以 HTTP Range Request 從斷點繼續</p>
+</header>
+
+<div class="layout">
+
+    <!-- File list -->
+    <div class="files-panel">
+        <div class="panel-title">PDF 檔案</div>
+        <div class="file-scroll" id="file-list">
+            <div class="no-files">載入中...</div>
+        </div>
+    </div>
+
+    <!-- Main -->
+    <div class="main-panel">
+
+        <!-- Selected file header -->
+        <div class="file-header" id="file-header">
+            <span class="fh-placeholder">← 選擇一個 PDF 檔案開始</span>
+        </div>
+
+        <!-- Download area -->
+        <div class="download-area">
+
+            <!-- Progress bar -->
+            <div class="progress-track" id="progress-track">
+                <div class="prog-seg initial" id="seg-initial" style="width:0%"></div>
+                <div class="prog-seg resumed" id="seg-resumed" style="width:0%; --resume-left:0%"></div>
+                <div class="prog-track-label" id="prog-pct">0%</div>
+            </div>
+
+            <!-- Numbers -->
+            <div class="progress-numbers">
+                <span class="prog-received" id="prog-received">0 B / —</span>
+                <span class="prog-speed"    id="prog-speed"></span>
+                <span class="prog-total"    id="prog-total"></span>
+            </div>
+
+            <!-- Status -->
+            <div class="status-line">
+                <span class="badge badge-idle" id="status-badge">⬤ 待機</span>
+                <span class="status-detail"   id="status-detail">選擇檔案後點擊下載</span>
+            </div>
+
+            <!-- Actions -->
+            <div class="actions" id="actions">
+                <button class="btn btn-download" id="btn-download" onclick="startDownload()" disabled>⬇ 開始下載</button>
+                <button class="btn btn-resume"   id="btn-resume"   onclick="resumeDownload()" style="display:none">⟳ 從斷點續傳</button>
+                <button class="btn btn-cancel"   id="btn-cancel"   onclick="cancelDownload()" style="display:none">✕ 中止</button>
+                <button class="btn btn-reset"    id="btn-reset"    onclick="resetDownload()"  style="display:none">↺ 重置</button>
+            </div>
+
+            <!-- Legend -->
+            <div class="legend" id="legend" style="display:none">
+                <span><span class="legend-dot" style="background:#3182ce"></span>初次下載</span>
+                <span><span class="legend-dot" style="background:#38a169"></span>續傳部分</span>
+                <span><span class="legend-dot" style="background:#2d3748"></span>尚未接收</span>
+            </div>
+
+        </div>
+
+        <!-- Log -->
+        <div class="log-area">
+            <div class="log-title">
+                Request / Event Log
+                <button class="log-clear" onclick="clearLog()">清除</button>
+            </div>
+            <div class="log-box" id="log">
+                <div class="le le-info"><span class="t-info">等待操作...</span></div>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+// ────────────────────────────────────────────────────────────
+// State
+// ────────────────────────────────────────────────────────────
+const S = {
+    file:        null,    // { name, size }
+    chunks:      [],      // Uint8Array[]
+    received:    0,       // bytes received so far
+    resumeFrom:  0,       // byte offset where resume started
+    interruptAt: 0,       // simulated interruption byte
+    phase:       'idle',  // idle | downloading | interrupted | resuming | done
+    abort:       null,    // AbortController
+    speedTs:     0,
+    speedBytes:  0,
+    speed:       0,
+};
+
+// ────────────────────────────────────────────────────────────
+// File list
+// ────────────────────────────────────────────────────────────
+async function loadFiles() {
+    try {
+        const files = await fetch('/api/files').then(r => r.json());
+        const el = document.getElementById('file-list');
+        if (!files.length) {
+            el.innerHTML = `<div class="no-files">沒有 PDF 檔案<br>請放入 <code>file-storage/</code></div>`;
+            return;
+        }
+        el.innerHTML = files.map(f =>
+            `<div class="file-item" id="fi-${CSS.escape(f.name)}" onclick="selectFile('${f.name}',${f.size})">
+                <span class="f-name">${f.name}</span>
+                <span class="f-size">${fmt(f.size)}</span>
+            </div>`
+        ).join('');
+    } catch {
+        document.getElementById('file-list').innerHTML =
+            `<div class="no-files">無法連線 API Server</div>`;
+    }
+}
+
+function selectFile(name, size) {
+    if (S.phase === 'downloading' || S.phase === 'resuming') return;
+
+    S.file = { name, size };
+    resetState();
+
+    document.querySelectorAll('.file-item').forEach(e => e.classList.remove('active'));
+    document.getElementById('fi-' + CSS.escape(name))?.classList.add('active');
+
+    document.getElementById('file-header').innerHTML =
+        `<span class="fh-icon">📄</span>
+         <div>
+           <div class="fh-name">${name}</div>
+           <div class="fh-size">${fmt(size)} &nbsp;·&nbsp; ${size.toLocaleString()} bytes</div>
+         </div>`;
+
+    document.getElementById('btn-download').disabled = false;
+    document.getElementById('prog-total').textContent = fmt(size);
+    setBadge('idle', '待機', '點擊「開始下載」');
+    log('info', `選擇 ${name}`, fmt(size));
+}
+
+// ────────────────────────────────────────────────────────────
+// Download flow
+// ────────────────────────────────────────────────────────────
+async function startDownload() {
+    if (!S.file) return;
+
+    resetState();
+    S.phase       = 'downloading';
+    S.interruptAt = Math.floor(S.file.size * (0.25 + Math.random() * 0.4));
+    S.abort       = new AbortController();
+    S.speedTs     = Date.now();
+    S.speedBytes  = 0;
+
+    showButtons({ cancel: true });
+    setBadge('downloading', '下載中', '');
+    document.getElementById('legend').style.display = 'flex';
+
+    const url = `/api/pdf/${encodeURIComponent(S.file.name)}`;
+    log('req', `GET ${url}`, '(無 Range Header)');
+
+    let res;
+    try {
+        res = await fetch(url, { signal: S.abort.signal });
+    } catch (e) {
+        if (e.name !== 'AbortError') handleError(e);
+        return;
+    }
+
+    if (!res.ok) {
+        handleError(new Error(`HTTP ${res.status}：請確認 PDF Server (:8081) 是否正在運行`));
+        return;
+    }
+
+    const total = parseInt(res.headers.get('Content-Length')) || S.file.size;
+    log('200', `200 OK`,
+        `Content-Length: ${fmt(total)} · Accept-Ranges: ${res.headers.get('Accept-Ranges') || '?'}`);
+
+    await readStream(res.body.getReader(), total, false);
+}
+
+async function resumeDownload() {
+    if (S.phase !== 'interrupted') return;
+
+    S.phase      = 'resuming';
+    S.resumeFrom = S.received;
+    S.abort      = new AbortController();
+    S.speedTs    = Date.now();
+    S.speedBytes = 0;
+
+    showButtons({ cancel: true });
+    setBadge('resuming', '續傳中', `從 ${fmt(S.received)} 繼續`);
+
+    const rangeVal = `bytes=${S.received}-`;
+    const url = `/api/pdf/${encodeURIComponent(S.file.name)}`;
+    log('req', `GET ${url}`, `Range: ${rangeVal}`);
+
+    let res;
+    try {
+        res = await fetch(url, {
+            headers: { 'Range': rangeVal },
+            signal: S.abort.signal,
+        });
+    } catch (e) {
+        if (e.name !== 'AbortError') handleError(e);
+        return;
+    }
+
+    if (res.status !== 206) {
+        handleError(new Error(`HTTP ${res.status}：預期 206 Partial Content`));
+        return;
+    }
+
+    const contentRange = res.headers.get('Content-Range') || '—';
+    const contentLen   = res.headers.get('Content-Length') || '—';
+    log('206', `206 Partial Content`,
+        `Content-Range: ${contentRange} · Length: ${contentLen}`);
+
+    await readStream(res.body.getReader(), S.file.size, true);
+}
+
+// Core streaming loop
+async function readStream(reader, total, isResume) {
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) break;  // 正常結束，跳出後再判斷是否真正完成
+
+            S.chunks.push(value);
+            S.received += value.length;
+            updateSpeed(value.length);
+            renderProgress(total);
+
+            // 模擬中斷：先設 phase，再 abort，最後 break
+            if (!isResume && S.phase === 'downloading' && S.received >= S.interruptAt) {
+                S.phase = 'interrupted';
+                S.abort.abort();  // 關閉底層連線
+                break;
+            }
+        }
+    } catch (e) {
+        // abort() 觸發的 AbortError，或其他意外錯誤
+        if (S.phase === 'downloading' || S.phase === 'resuming') {
+            S.phase = 'interrupted';
+        }
+    }
+
+    if (S.phase === 'interrupted') {
+        onInterrupted(total);
+    } else if (S.phase === 'downloading' || S.phase === 'resuming') {
+        // done=true 跳出迴圈：確認實際收到的量是否符合預期
+        if (total > 0 && S.received < total * 0.99) {
+            // 串流提前結束（伺服器錯誤或連線問題）
+            S.phase = 'interrupted';
+            onInterrupted(total);
+        } else {
+            S.phase = 'done';
+            onComplete();
+        }
+    }
+}
+
+function onInterrupted(total) {
+    const pct = (S.received / total * 100).toFixed(1);
+    showButtons({ resume: true, reset: true });
+    setBadge('interrupted', '⚡ 中斷！', `已接收 ${fmt(S.received)} (${pct}%)，待續傳 ${fmt(total - S.received)}`);
+    log('warn', `下載中斷`,
+        `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，將從此處續傳`);
+}
+
+function onComplete() {
+    renderProgress(S.file.size);
+    setBadge('done', '✓ 完成', `共 ${fmt(S.received)}，儲存中...`);
+    showButtons({ reset: true });
+
+    const blob = new Blob(S.chunks, { type: 'application/pdf' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = S.file.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    log('ok', `✓ 下載完成`,
+        `${fmt(blob.size)} · 由 ${S.resumeFrom ? '2' : '1'} 段請求組成`);
+    if (S.resumeFrom) {
+        log('info',
+            `初次: bytes 0–${(S.resumeFrom - 1).toLocaleString()} `,
+            `續傳: bytes ${S.resumeFrom.toLocaleString()}–${(S.received - 1).toLocaleString()}`);
+    }
+}
+
+function cancelDownload() {
+    S.phase = 'interrupted';  // 先設 phase，catch 才能正確判斷
+    S.abort?.abort();
+}
+
+function handleError(e) {
+    setBadge('interrupted', '✕ 錯誤', e.message);
+    showButtons({ reset: true });
+    log('warn', `錯誤`, e.message);
+}
+
+// ────────────────────────────────────────────────────────────
+// UI helpers
+// ────────────────────────────────────────────────────────────
+function renderProgress(total) {
+    const pct = total > 0 ? S.received / total * 100 : 0;
+
+    if (S.resumeFrom === 0) {
+        // Initial download — grow the blue bar
+        document.getElementById('seg-initial').style.width = pct + '%';
+    } else {
+        // Resumed — blue bar stays frozen, green bar grows from resumeFrom
+        const resumePct    = S.resumeFrom / total * 100;
+        const resumedWidth = (S.received - S.resumeFrom) / total * 100;
+        document.getElementById('seg-initial').style.width = resumePct + '%';
+        const seg = document.getElementById('seg-resumed');
+        seg.style.setProperty('--resume-left', resumePct + '%');
+        seg.style.width = resumedWidth + '%';
+    }
+
+    document.getElementById('prog-pct').textContent = pct.toFixed(1) + '%';
+    document.getElementById('prog-received').textContent =
+        `${fmt(S.received)} / ${fmt(total)}`;
+    if (S.speed > 0) {
+        document.getElementById('prog-speed').textContent = fmt(S.speed) + '/s';
+    }
+}
+
+function updateSpeed(bytes) {
+    S.speedBytes += bytes;
+    const now = Date.now();
+    const elapsed = now - S.speedTs;
+    if (elapsed >= 300) {
+        S.speed     = Math.round(S.speedBytes / elapsed * 1000);
+        S.speedTs   = now;
+        S.speedBytes = 0;
+    }
+}
+
+function setBadge(phase, label, detail) {
+    const badge = document.getElementById('status-badge');
+    badge.className = `badge badge-${phase}`;
+    badge.textContent = label;
+    const d = document.getElementById('status-detail');
+    d.textContent = detail;
+    d.className = 'status-detail' + (phase === 'interrupted' ? ' highlight' : '');
+}
+
+function showButtons({ download = false, resume = false, cancel = false, reset = false } = {}) {
+    document.getElementById('btn-download').style.display = download ? '' : 'none';
+    document.getElementById('btn-resume').style.display   = resume  ? '' : 'none';
+    document.getElementById('btn-cancel').style.display   = cancel  ? '' : 'none';
+    document.getElementById('btn-reset').style.display    = reset   ? '' : 'none';
+}
+
+function resetState() {
+    S.chunks     = [];
+    S.received   = 0;
+    S.resumeFrom = 0;
+    S.phase      = 'idle';
+    S.speed      = 0;
+    S.abort      = null;
+
+    document.getElementById('seg-initial').style.width = '0%';
+    document.getElementById('seg-resumed').style.width = '0%';
+    document.getElementById('prog-pct').textContent    = '0%';
+    document.getElementById('prog-received').textContent = '0 B / —';
+    document.getElementById('prog-speed').textContent  = '';
+    document.getElementById('prog-total').textContent  = S.file ? fmt(S.file.size) : '';
+    document.getElementById('legend').style.display    = 'none';
+}
+
+function resetDownload() {
+    resetState();
+    showButtons({ download: true });
+    setBadge('idle', '待機', '點擊「開始下載」');
+    log('info', '已重置');
+}
+
+// ────────────────────────────────────────────────────────────
+// Log
+// ────────────────────────────────────────────────────────────
+function log(type, main, detail = '') {
+    const box = document.getElementById('log');
+    if (box.querySelector('.t-info') && box.children.length === 1) box.innerHTML = '';
+
+    const time = new Date().toTimeString().slice(0, 8);
+    const cls  = { req:'le-req', '200':'le-200', '206':'le-206', warn:'le-warn', ok:'le-ok', info:'le-info' }[type] || '';
+    const mc   = { req:'t-req', '200':'t-200',   '206':'t-206',  warn:'t-warn', ok:'t-ok',  info:'t-info'  }[type] || 't-dim';
+
+    const entry = document.createElement('div');
+    entry.className = `le ${cls}`;
+    entry.innerHTML =
+        `<span class="t-time">${time}</span> ` +
+        `<span class="${mc}">${main}</span>` +
+        (detail ? ` <span class="t-dim">${detail}</span>` : '');
+    box.appendChild(entry);
+    box.scrollTop = box.scrollHeight;
+}
+
+function clearLog() {
+    document.getElementById('log').innerHTML =
+        '<div class="le le-info"><span class="t-info">等待操作...</span></div>';
+}
+
+function fmt(b) {
+    if (!b && b !== 0) return '—';
+    if (b < 1024)      return b + ' B';
+    if (b < 1048576)   return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(2) + ' MB';
+}
+
+loadFiles();
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+spring:
+  application:
+    name: range-streaming-pdf
+
+server:
+  port: 8081
