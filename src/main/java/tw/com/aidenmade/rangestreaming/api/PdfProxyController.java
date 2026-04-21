@@ -1,6 +1,8 @@
 package tw.com.aidenmade.rangestreaming.api;
 
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -9,7 +11,6 @@ import org.springframework.web.bind.annotation.RestController;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
@@ -34,6 +35,7 @@ import java.util.stream.Collectors;
 @RestController
 public class PdfProxyController {
 
+    private static final Logger log = LoggerFactory.getLogger(PdfProxyController.class);
     private static final String PDF_SERVER_BASE = "http://localhost:8081/files/";
 
     /**
@@ -66,67 +68,65 @@ public class PdfProxyController {
             @RequestHeader(value = "Range", required = false) String range,
             HttpServletResponse response) throws IOException {
 
-        // 防止路徑遍歷攻擊（Path Traversal）
-        // 若允許 "../" 這類字元，惡意請求可能讀取 file-storage 以外的系統檔案
         if (filename.contains("..") || filename.contains("/") || filename.contains("\\")) {
+            log.warn("Browser → PROXY   | 400 Bad Request — 路徑遍歷嘗試: {}", filename);
             response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
             return;
         }
 
-        // URL 編碼中文或特殊字元的檔名
-        // 中文在 URL 中必須轉成 %XX 格式（如「實」→ %E5%AF%A6）
-        // replace("+", "%20")：URLEncoder 把空格編成 +，但 URL path 中空格應為 %20
         String encoded = URLEncoder.encode(filename, StandardCharsets.UTF_8).replace("+", "%20");
         URL url = new URL(PDF_SERVER_BASE + encoded);
 
+        log.info("Browser → PROXY   | {} | Range: {}", filename, range != null ? range : "(none)");
+
+        long startTs = System.currentTimeMillis();
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setConnectTimeout(5000);
         conn.setReadTimeout(30000);
 
-        // ★ Range 轉傳：這是代理的核心
-        // 前端帶來的 Range header 必須原封不動地傳給 PDF Server，
-        // PDF Server 才會知道要回傳哪個 byte 區段
         if (range != null) {
             conn.setRequestProperty("Range", range);
         }
 
-        // 從 PDF Server 取得回應狀態碼並原樣回傳給前端
-        // 完整下載時 PDF Server 回傳 200，Range 請求時回傳 206
+        log.info("PROXY  → PdfSvr  | GET {} | Range: {}", url, range != null ? range : "(none)");
+
         int status = conn.getResponseCode();
         response.setStatus(status);
         response.setContentType("application/pdf");
 
-        // ★ 告知前端此資源支援 Range 請求（斷點續傳的前提）
-        // 前端看到這個 header 才知道可以用 Range: bytes=X- 來續傳
-        response.setHeader("Accept-Ranges", "bytes");
+        String acceptRanges = conn.getHeaderField("Accept-Ranges");
+        if (acceptRanges != null) {
+            response.setHeader("Accept-Ranges", acceptRanges);
+        }
 
-        // ★ 轉傳 Content-Range header（206 回應時必須有）
-        // 格式：bytes 起點-終點/總大小，例如：bytes 1024-2047/10240
-        // 前端靠這個 header 確認「收到的是哪一段」
         String contentRange = conn.getHeaderField("Content-Range");
         if (contentRange != null) {
             response.setHeader("Content-Range", contentRange);
         }
 
-        // 轉傳 Content-Length，讓前端知道這次回應的 body 有多少 bytes
-        // 完整下載時 = 整個檔案大小；Range 請求時 = 此段的大小
         String contentLength = conn.getHeaderField("Content-Length");
         if (contentLength != null) {
             response.setHeader("Content-Length", contentLength);
         }
 
-        // ★ Streaming（串流）傳輸：邊讀邊寫，不把整個檔案載入記憶體
-        // transferTo() 內部使用固定大小的 buffer 循環讀寫，
-        // 無論檔案多大，記憶體用量都是固定的（約 8KB buffer）
-        // status >= 400 時改用 getErrorStream()，避免 getInputStream() 拋出例外
-        try (InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-             OutputStream out = response.getOutputStream()) {
-            if (in != null) {
-                in.transferTo(out);
-            }
+        log.info("PdfSvr → PROXY   | status={} | Content-Length: {} | Content-Range: {} | Accept-Ranges: {}",
+                status,
+                contentLength != null ? contentLength : "—",
+                contentRange != null ? contentRange : "—",
+                acceptRanges != null ? acceptRanges : "—");
+
+        byte[] body;
+        try (InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
+            body = in != null ? in.readAllBytes() : new byte[0];
         } finally {
             conn.disconnect();
         }
+
+        long elapsed = System.currentTimeMillis() - startTs;
+        log.info("PROXY  → Browser | 寫入記憶體完成 | {} bytes | 耗時 {} ms", body.length, elapsed);
+
+        response.setHeader("Content-Length", String.valueOf(body.length));
+        response.getOutputStream().write(body);
     }
 
     /**
@@ -135,17 +135,21 @@ public class PdfProxyController {
      */
     @GetMapping("/api/files")
     public List<Map<String, Object>> listFiles() {
+        log.info("Browser → PROXY   | GET /api/files");
         File dir = new File("file-storage");
         if (!dir.exists() || !dir.isDirectory()) {
+            log.warn("[PROXY]  file-storage 目錄不存在");
             return List.of();
         }
         File[] files = dir.listFiles(f -> f.isFile() && f.getName().toLowerCase().endsWith(".pdf"));
         if (files == null) {
             return List.of();
         }
-        return Arrays.stream(files)
+        List<Map<String, Object>> result = Arrays.stream(files)
                 .sorted(Comparator.comparing(File::getName))
                 .map(f -> Map.<String, Object>of("name", f.getName(), "size", f.length()))
                 .collect(Collectors.toList());
+        log.info("PROXY → Browser | 回傳 {} 個 PDF 檔案", result.size());
+        return result;
     }
 }

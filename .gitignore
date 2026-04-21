@@ -32,5 +32,8 @@ build/
 ### VS Code ###
 .vscode/
 
+### Claude local settings ###
+.claude/settings.local.json
+
 ### files ###
 file-storage/
