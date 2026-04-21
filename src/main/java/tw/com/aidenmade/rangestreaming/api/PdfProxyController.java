@@ -81,10 +81,13 @@ public class PdfProxyController {
 
         long startTs = System.currentTimeMillis();
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        // 連線逾時要短：PDF Server 不可達時快速失敗，避免 API 請求長時間卡住。
         conn.setConnectTimeout(5000);
+        // 讀取逾時稍長：允許大檔或慢網路持續串流，但仍保留上限避免無限等待。
         conn.setReadTimeout(30000);
 
         if (range != null) {
+            // 將前端的 Range 原樣轉發到 PDF Server，讓上游決定是否回傳 206 區段內容。
             conn.setRequestProperty("Range", range);
         }
 
@@ -96,16 +99,19 @@ public class PdfProxyController {
 
         String acceptRanges = conn.getHeaderField("Accept-Ranges");
         if (acceptRanges != null) {
+            // 回傳上游的可續傳能力（通常是 bytes），讓前端知道可用 Range 續傳。
             response.setHeader("Accept-Ranges", acceptRanges);
         }
 
         String contentRange = conn.getHeaderField("Content-Range");
         if (contentRange != null) {
+            // 續傳時把實際區段範圍透傳給前端（例如 bytes 1000-1999/5000）。
             response.setHeader("Content-Range", contentRange);
         }
 
         String contentLength = conn.getHeaderField("Content-Length");
         if (contentLength != null) {
+            // 透傳本次回應 body 長度；206 時是片段長度，200 時通常是整檔長度。
             response.setHeader("Content-Length", contentLength);
         }
 
