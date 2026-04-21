@@ -3,6 +3,7 @@ package tw.com.aidenmade.rangestreaming.pdf;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -22,9 +23,12 @@ public class PdfFileController {
     private static final Logger log = LoggerFactory.getLogger(PdfFileController.class);
 
     private final PdfFileStore store;
+    private final boolean rangeEnabled;
 
-    public PdfFileController(PdfFileStore store) {
+    public PdfFileController(PdfFileStore store,
+                             @Value("${pdf.range-enabled:true}") boolean rangeEnabled) {
         this.store = store;
+        this.rangeEnabled = rangeEnabled;
     }
 
     /**
@@ -52,10 +56,17 @@ public class PdfFileController {
         }
 
         response.setContentType("application/pdf");
-        response.setHeader("Accept-Ranges", "bytes");
+        if (rangeEnabled) {
+            response.setHeader("Accept-Ranges", "bytes");
+        }
 
-        if (range == null) {
-            log.info("[PDF  →] 200 OK | {} | {} bytes", filename, content.length);
+        // 關閉 Range 時一律回完整檔案，即使客戶端有帶 Range header。
+        if (!rangeEnabled || range == null) {
+            log.info("[PDF  →] 200 OK | {} | {} bytes | rangeEnabled={} | requestRange={}",
+                    filename,
+                    content.length,
+                    rangeEnabled,
+                    range != null ? range : "(none)");
             response.setStatus(HttpServletResponse.SC_OK);
             response.setHeader("Content-Length", String.valueOf(content.length));
             response.getOutputStream().write(content);
