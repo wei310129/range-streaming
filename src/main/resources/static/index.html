@@ -387,17 +387,23 @@
 // 下載狀態機
 // phase 轉換：idle → downloading → interrupted → resuming → done
 const S = {
-    file:        null,   // 當前選擇的檔案 { name, size }
-    chunks:      [],     // 所有已收到的資料片段（Uint8Array[]），兩段請求共用此陣列
-    received:    0,      // 目前累計收到的 bytes 數（同時也是續傳時的斷點位置）
-    resumeFrom:  0,      // 記錄第二段請求的起點，用於進度條顯示「初次/續傳」兩色區塊
-    interruptAt: 0,      // 【模擬用】預設在此 byte 數觸發中斷
-    phase:       'idle', // 狀態機：idle | downloading | interrupted | resuming | done
-    abort:       null,   // AbortController 實例，用來主動中止 fetch 連線
-    speedTs:     0,      // 速度計算用：上次更新的時間戳
-    speedBytes:  0,      // 速度計算用：上次更新後累計的 bytes
-    speed:       0,      // 目前計算出的下載速度（bytes/sec）
+    file:          null,   // 當前選擇的檔案 { name, size }
+    chunks:        [],     // 所有已收到的資料片段（Uint8Array[]），兩段請求共用此陣列
+    received:      0,      // 目前累計收到的 bytes 數（同時也是續傳時的斷點位置）
+    resumeFrom:    0,      // 記錄第二段請求的起點，用於進度條顯示「初次/續傳」兩色區塊
+    interruptAt:   0,      // 【模擬用】預設在此 byte 數觸發中斷
+    phase:         'idle', // 狀態機：idle | downloading | interrupted | resuming | done
+    abort:         null,   // AbortController 實例，用來主動中止 fetch 連線
+    speedTs:       0,      // 速度計算用：上次更新的時間戳
+    speedBytes:    0,      // 速度計算用：上次更新後累計的 bytes
+    speed:         0,      // 目前計算出的下載速度（bytes/sec）
+    retryTimer:    null,   // 自動續傳的 setTimeout handle
+    userCancelled: false,  // 使用者主動點「中止」時設為 true，阻止自動續傳
+    retryCount:    0,      // 在同一個 byte 位置連續失敗的次數
+    lastFailedAt:  -1,     // 上次失敗時的 S.received（-1 = 尚無失敗記錄）
 };
+
+const MAX_RETRIES = 3;  // 同一位置最多自動重試幾次
 
 // ════════════════════════════════════════════════════════════
 // 【重要】斷點續傳是真實行為，不是 UI 假象
@@ -697,10 +703,45 @@ async function readStream(reader, total, isResume) {
  */
 function onInterrupted(total) {
     const pct = (S.received / total * 100).toFixed(1);
-    showButtons({ resume: true, reset: true });
-    setBadge('interrupted', '⚡ 中斷！', `已接收 ${fmt(S.received)} (${pct}%)，待續傳 ${fmt(total - S.received)}`);
-    log('warn', `下載中斷`,
-        `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，S.chunks 保留中，可從此處續傳`);
+
+    if (S.userCancelled) {
+        // 使用者主動點「中止」→ 不自動續傳，顯示手動續傳按鈕
+        showButtons({ resume: true, reset: true });
+        setBadge('interrupted', '⚡ 中斷！', `已接收 ${fmt(S.received)} (${pct}%)，待續傳 ${fmt(total - S.received)}`);
+        log('warn', `下載中斷`,
+            `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，S.chunks 保留中，可從此處續傳`);
+    } else {
+        // 網路/模擬中斷 → 更新重試計數，再決定是否自動續傳
+        if (S.received === S.lastFailedAt) {
+            // 同一個位置再次失敗 → 計數 +1
+            S.retryCount++;
+        } else {
+            // 有推進（或第一次失敗）→ 重置計數
+            S.retryCount   = 1;
+            S.lastFailedAt = S.received;
+        }
+
+        if (S.retryCount >= MAX_RETRIES) {
+            // 同一位置連失敗 MAX_RETRIES 次，放棄自動重試
+            showButtons({ resume: true, reset: true });
+            setBadge('interrupted', '⚡ 中斷！',
+                `在 ${fmt(S.received)} 處連續失敗 ${S.retryCount} 次，請手動續傳或重置`);
+            log('warn', `自動續傳放棄`,
+                `在 ${S.received.toLocaleString()} bytes 處連續失敗 ${S.retryCount} 次`);
+        } else {
+            // 還在重試上限內 → 1 秒後自動續傳
+            showButtons({ reset: true });
+            setBadge('interrupted', '⚡ 中斷！',
+                `已接收 ${fmt(S.received)} (${pct}%)，1 秒後自動續傳... (第 ${S.retryCount}/${MAX_RETRIES} 次)`);
+            log('warn', `下載中斷`,
+                `已接收 ${S.received.toLocaleString()} bytes (${pct}%)，自動續傳 第 ${S.retryCount}/${MAX_RETRIES} 次`);
+
+            S.retryTimer = setTimeout(() => {
+                S.retryTimer = null;
+                if (S.phase === 'interrupted') resumeDownload();
+            }, 1000);
+        }
+    }
 }
 
 /**
@@ -746,6 +787,7 @@ function onComplete() {
  * 中止後 S.chunks 保留，使用者仍可點「從斷點續傳」繼續。
  */
 function cancelDownload() {
+    S.userCancelled = true;  // 標記為使用者主動取消，onInterrupted 不會自動續傳
     S.phase = 'interrupted';
     S.abort?.abort();
 }
@@ -835,12 +877,16 @@ function showButtons({ download = false, resume = false, cancel = false, reset =
 }
 
 function resetState() {
-    S.chunks     = [];
-    S.received   = 0;
-    S.resumeFrom = 0;
-    S.phase      = 'idle';
-    S.speed      = 0;
-    S.abort      = null;
+    if (S.retryTimer) { clearTimeout(S.retryTimer); S.retryTimer = null; }
+    S.chunks         = [];
+    S.received       = 0;
+    S.resumeFrom     = 0;
+    S.phase          = 'idle';
+    S.speed          = 0;
+    S.abort          = null;
+    S.userCancelled  = false;
+    S.retryCount     = 0;
+    S.lastFailedAt   = -1;
 
     document.getElementById('seg-initial').style.width = '0%';
     document.getElementById('seg-resumed').style.width = '0%';
