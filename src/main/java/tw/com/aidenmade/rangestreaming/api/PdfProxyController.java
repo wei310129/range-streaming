@@ -94,8 +94,11 @@ public class PdfProxyController {
         log.info("PROXY  → PdfSvr  | GET {} | Range: {}", url, range != null ? range : "(none)");
 
         int status = conn.getResponseCode();
+        // Accept-Ranges（可接受的範圍）：伺服器可接受的 Range 單位（例如：bytes）。
         String acceptRanges = conn.getHeaderField("Accept-Ranges");
+        // Content-Range（內容範圍）：本次回應內容在整體檔案中的位元組區間（例如：bytes 1000-1999/5000）。
         String contentRange = conn.getHeaderField("Content-Range");
+        // Content-Length（內容長度）：本次回應 body 的位元組長度（例如：1000）。
         String contentLength = conn.getHeaderField("Content-Length");
 
         log.info("PdfSvr → PROXY   | status={} | Content-Length: {} | Content-Range: {} | Accept-Ranges: {}",
@@ -105,9 +108,12 @@ public class PdfProxyController {
                 acceptRanges != null ? acceptRanges : "—");
 
         byte[] body;
+        // 4xx/5xx 讀 error stream、其餘讀正常 stream，確保不漏掉上游回應內容。
         try (InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream()) {
+            // 可能遇到無 body 回應（in 為 null），此時以空陣列代表。
             body = in != null ? in.readAllBytes() : new byte[0];
         } finally {
+            // 無論成功或失敗都主動釋放 HttpURLConnection 資源。
             conn.disconnect();
         }
 
@@ -119,24 +125,30 @@ public class PdfProxyController {
         // 上游若忽略 Range 並回 200，代理端仍維持續傳語意：本地切片後回 206。
         if (range != null && status == HttpServletResponse.SC_OK) {
             int[] bounds = parseRange(range, body.length);
+            // parseRange 回 null 代表 Range 格式錯誤或請求範圍超出檔案可滿足區間。
             if (bounds == null) {
                 log.warn("PROXY  → Browser | 416 Range Not Satisfiable | Range={} | total={}", range, body.length);
                 response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+                // 告知客戶端伺服器支援 bytes，但本次請求無法滿足；*/total 表示可用總長度。
                 response.setHeader("Accept-Ranges", "bytes");
                 response.setHeader("Content-Range", "bytes */" + body.length);
+                // 416 回應不回傳檔案內容，因此 body 長度為 0。
                 response.setHeader("Content-Length", "0");
                 return;
             }
 
+            // 由解析結果取得要回傳的區段起訖，length 為本次片段實際大小。
             int start = bounds[0];
             int end = bounds[1];
             int length = end - start + 1;
 
             log.info("PROXY  → Browser | fallback 206 | bytes {}-{}/{} ({} bytes)", start, end, body.length, length);
+            // 以 206 + Range 相關標頭回覆，維持前端續傳所需的 HTTP 語意。
             response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
             response.setHeader("Accept-Ranges", "bytes");
             response.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + body.length);
             response.setHeader("Content-Length", String.valueOf(length));
+            // 只寫出 body 指定區段（start 起算、共 length bytes）。
             response.getOutputStream().write(body, start, length);
             return;
         }

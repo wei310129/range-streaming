@@ -96,36 +96,62 @@ public class PdfFileController {
     }
 
     /**
-     * 解析 Range header，回傳 [start, end]（inclusive，已夾在合法範圍內）。
-     * 格式非法時回傳 null。
+     * 解析單一 Range header，回傳 [start, end]（兩端都包含，inclusive）。
+     *
+     * 支援格式：
+     *   1) bytes=500-999  -> 明確起訖
+     *   2) bytes=500-     -> 從 500 到檔案結尾
+     *   3) bytes=-500     -> 最後 500 bytes
+     *
+     * 回傳 null 代表「格式錯誤或範圍不可滿足」，例如：
+     *   - 不是 bytes= 開頭
+     *   - 缺少 '-' 分隔
+     *   - 數字解析失敗
+     *   - start 超出檔案大小、或 end < start
+     *
+     * total 參數用途：
+     *   - 代表「完整檔案總長度（bytes）」；呼叫端傳入的是 content.length
+     *   - 用來計算 EOF（total - 1）、suffix 起點、以及範圍合法性檢查
+     *
+     * 例子（total = 10，合法 byte 索引為 0..9）：
+     *   - bytes=2-   -> [2, 9]
+     *   - bytes=-3   -> [7, 9]
+     *   - bytes=2-20 -> [2, 9]（end 會被夾到 total - 1）
      */
     private int[] parseRange(String rangeHeader, int total) {
+        // 只接受 bytes 單位；其他單位直接視為無效。
         if (!rangeHeader.startsWith("bytes=")) return null;
 
+        // 拿掉 "bytes=" 後只保留區間規格，例如 "500-"、"-500"、"500-999"。
         String spec   = rangeHeader.substring("bytes=".length());
         String[] parts = spec.split("-", 2);
+        // 必須剛好能拆成 [左邊, 右邊] 兩段。
         if (parts.length != 2) return null;
 
         try {
             int start, end;
             if (parts[0].isEmpty()) {
-                // bytes=-500：最後 N bytes
+                // bytes=-N：取最後 N bytes。
                 int suffix = Integer.parseInt(parts[1]);
                 start = Math.max(0, total - suffix);
                 end   = total - 1;
             } else if (parts[1].isEmpty()) {
-                // bytes=500-：到 EOF
+                // bytes=X-：從 X 取到 EOF。
                 start = Integer.parseInt(parts[0]);
                 end   = total - 1;
             } else {
+                // bytes=X-Y：明確起訖。
                 start = Integer.parseInt(parts[0]);
                 end   = Integer.parseInt(parts[1]);
             }
 
+            // start 必須落在檔案內，且 end 不能小於 start。
             if (start < 0 || start >= total || end < start) return null;
+            // 若 end 超過檔案尾端，夾到最後一個合法 byte。
             end = Math.min(end, total - 1);
             return new int[]{start, end};
         } catch (NumberFormatException e) {
+            // 非數字（例如 bytes=a-b）視為格式錯誤。
             return null;
         }
     }
