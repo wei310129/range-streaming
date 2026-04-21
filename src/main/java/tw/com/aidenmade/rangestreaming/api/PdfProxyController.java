@@ -94,26 +94,9 @@ public class PdfProxyController {
         log.info("PROXY  → PdfSvr  | GET {} | Range: {}", url, range != null ? range : "(none)");
 
         int status = conn.getResponseCode();
-        response.setStatus(status);
-        response.setContentType("application/pdf");
-
         String acceptRanges = conn.getHeaderField("Accept-Ranges");
-        if (acceptRanges != null) {
-            // 回傳上游的可續傳能力（通常是 bytes），讓前端知道可用 Range 續傳。
-            response.setHeader("Accept-Ranges", acceptRanges);
-        }
-
         String contentRange = conn.getHeaderField("Content-Range");
-        if (contentRange != null) {
-            // 續傳時把實際區段範圍透傳給前端（例如 bytes 1000-1999/5000）。
-            response.setHeader("Content-Range", contentRange);
-        }
-
         String contentLength = conn.getHeaderField("Content-Length");
-        if (contentLength != null) {
-            // 透傳本次回應 body 長度；206 時是片段長度，200 時通常是整檔長度。
-            response.setHeader("Content-Length", contentLength);
-        }
 
         log.info("PdfSvr → PROXY   | status={} | Content-Length: {} | Content-Range: {} | Accept-Ranges: {}",
                 status,
@@ -131,8 +114,85 @@ public class PdfProxyController {
         long elapsed = System.currentTimeMillis() - startTs;
         log.info("PROXY  → Browser | 寫入記憶體完成 | {} bytes | 耗時 {} ms", body.length, elapsed);
 
+        response.setContentType("application/pdf");
+
+        // 上游若忽略 Range 並回 200，代理端仍維持續傳語意：本地切片後回 206。
+        if (range != null && status == HttpServletResponse.SC_OK) {
+            int[] bounds = parseRange(range, body.length);
+            if (bounds == null) {
+                log.warn("PROXY  → Browser | 416 Range Not Satisfiable | Range={} | total={}", range, body.length);
+                response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+                response.setHeader("Accept-Ranges", "bytes");
+                response.setHeader("Content-Range", "bytes */" + body.length);
+                response.setHeader("Content-Length", "0");
+                return;
+            }
+
+            int start = bounds[0];
+            int end = bounds[1];
+            int length = end - start + 1;
+
+            log.info("PROXY  → Browser | fallback 206 | bytes {}-{}/{} ({} bytes)", start, end, body.length, length);
+            response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
+            response.setHeader("Accept-Ranges", "bytes");
+            response.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + body.length);
+            response.setHeader("Content-Length", String.valueOf(length));
+            response.getOutputStream().write(body, start, length);
+            return;
+        }
+
+        response.setStatus(status);
+        if (acceptRanges != null) {
+            // 回傳上游的可續傳能力（通常是 bytes），讓前端知道可用 Range 續傳。
+            response.setHeader("Accept-Ranges", acceptRanges);
+        }
+        if (contentRange != null) {
+            // 續傳時把實際區段範圍透傳給前端（例如 bytes 1000-1999/5000）。
+            response.setHeader("Content-Range", contentRange);
+        }
+        if (contentLength != null) {
+            // 透傳本次回應 body 長度；206 時是片段長度，200 時通常是整檔長度。
+            response.setHeader("Content-Length", contentLength);
+        }
+
         response.setHeader("Content-Length", String.valueOf(body.length));
         response.getOutputStream().write(body);
+    }
+
+    static int[] parseRange(String rangeHeader, int total) {
+        if (rangeHeader == null || total <= 0 || !rangeHeader.startsWith("bytes=") || rangeHeader.contains(",")) {
+            return null;
+        }
+
+        String spec = rangeHeader.substring("bytes=".length());
+        String[] parts = spec.split("-", 2);
+        if (parts.length != 2 || (parts[0].isEmpty() && parts[1].isEmpty())) {
+            return null;
+        }
+
+        try {
+            int start;
+            int end;
+            if (parts[0].isEmpty()) {
+                int suffix = Integer.parseInt(parts[1]);
+                start = Math.max(0, total - suffix);
+                end = total - 1;
+            } else if (parts[1].isEmpty()) {
+                start = Integer.parseInt(parts[0]);
+                end = total - 1;
+            } else {
+                start = Integer.parseInt(parts[0]);
+                end = Integer.parseInt(parts[1]);
+            }
+
+            if (start < 0 || start >= total || end < start) {
+                return null;
+            }
+            end = Math.min(end, total - 1);
+            return new int[]{start, end};
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

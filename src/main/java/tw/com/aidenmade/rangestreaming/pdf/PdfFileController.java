@@ -39,8 +39,8 @@ public class PdfFileController {
      *   bytes=500-      → 回傳 byte 500 到 EOF
      *   bytes=-500      → 回傳最後 500 bytes
      *
-     * 無 Range → 200 OK + 完整檔案
-     * 有 Range → 206 Partial Content + Content-Range
+     * pdf.range-enabled=false → 忽略 Range，固定回 200 + 完整檔案
+     * pdf.range-enabled=true  → 無 Range 回 200；有 Range 回 206 + Content-Range
      */
     @GetMapping("/files/{filename}")
     public void serveFile(
