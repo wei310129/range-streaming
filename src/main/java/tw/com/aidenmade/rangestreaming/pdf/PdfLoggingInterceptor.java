@@ -4,6 +4,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 public class PdfLoggingInterceptor implements HandlerInterceptor {
@@ -14,7 +15,7 @@ public class PdfLoggingInterceptor implements HandlerInterceptor {
     @Override
     public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) {
         req.setAttribute(ATTR_START, System.currentTimeMillis());
-        String range = req.getHeader("Range");
+        String range = req.getHeader(HttpHeaders.RANGE);
         log.info("PROXY → PdfSvr  | {} {} | Range: {}", req.getMethod(), req.getRequestURI(),
                 range != null ? range : "(none)");
         return true;
@@ -24,9 +25,9 @@ public class PdfLoggingInterceptor implements HandlerInterceptor {
     public void afterCompletion(HttpServletRequest req, HttpServletResponse res, Object handler, Exception ex) {
         Long startTs = (Long) req.getAttribute(ATTR_START);
         long elapsed = startTs != null ? System.currentTimeMillis() - startTs : -1;
-        String contentRange  = res.getHeader("Content-Range");
-        String contentLength = res.getHeader("Content-Length");
-        String acceptRanges  = res.getHeader("Accept-Ranges");
+        String contentRange  = res.getHeader(HttpHeaders.CONTENT_RANGE);
+        String contentLength = res.getHeader(HttpHeaders.CONTENT_LENGTH);
+        String acceptRanges  = res.getHeader(HttpHeaders.ACCEPT_RANGES);
 
         log.info("PdfSvr → PROXY   | {} {} | status={} | Accept-Ranges={} | Content-Length={} | Content-Range={} | {}ms",
                 req.getMethod(), req.getRequestURI(),

@@ -4,6 +4,8 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -45,7 +47,7 @@ public class PdfFileController {
     @GetMapping("/files/{filename}")
     public void serveFile(
             @PathVariable String filename,
-            @RequestHeader(value = "Range", required = false) String range,
+            @RequestHeader(value = HttpHeaders.RANGE, required = false) String range,
             HttpServletResponse response) throws IOException {
 
         byte[] content = store.get(filename);
@@ -55,9 +57,9 @@ public class PdfFileController {
             return;
         }
 
-        response.setContentType("application/pdf");
+        response.setContentType(MediaType.APPLICATION_PDF_VALUE);
         if (rangeEnabled) {
-            response.setHeader("Accept-Ranges", "bytes");
+            response.setHeader(HttpHeaders.ACCEPT_RANGES, "bytes");
         }
 
         // 關閉 Range 時一律回完整檔案，即使客戶端有帶 Range header。
@@ -68,7 +70,7 @@ public class PdfFileController {
                     rangeEnabled,
                     range != null ? range : "(none)");
             response.setStatus(HttpServletResponse.SC_OK);
-            response.setHeader("Content-Length", String.valueOf(content.length));
+            response.setHeader(HttpHeaders.CONTENT_LENGTH, String.valueOf(content.length));
             response.getOutputStream().write(content);
             return;
         }
@@ -77,8 +79,8 @@ public class PdfFileController {
         int[] bounds = parseRange(range, content.length);
         if (bounds == null) {
             log.warn("[PDF  ] 416 Range 格式錯誤: {}", range);
-            response.setStatus(416); // Range Not Satisfiable
-            response.setHeader("Content-Range", "bytes */" + content.length);
+            response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+            response.setHeader(HttpHeaders.CONTENT_RANGE, "bytes */" + content.length);
             return;
         }
 
@@ -90,8 +92,8 @@ public class PdfFileController {
                 filename, start, end, content.length, length);
 
         response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
-        response.setHeader("Content-Range",  "bytes " + start + "-" + end + "/" + content.length);
-        response.setHeader("Content-Length", String.valueOf(length));
+        response.setHeader(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + content.length);
+        response.setHeader(HttpHeaders.CONTENT_LENGTH, String.valueOf(length));
         response.getOutputStream().write(content, start, length);
     }
 

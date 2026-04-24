@@ -3,6 +3,8 @@ package tw.com.aidenmade.rangestreaming.api;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -36,6 +38,8 @@ import java.util.stream.Collectors;
 public class PdfProxyController {
 
     private static final Logger log = LoggerFactory.getLogger(PdfProxyController.class);
+    private static final String PROXY_PDF_PATH = "/api/pdf/{filename}";
+    private static final String PROXY_FILES_PATH = "/api/files";
     private static final String PDF_SERVER_BASE = "http://localhost:8081/files/";
 
     /**
@@ -62,10 +66,10 @@ public class PdfProxyController {
      * @param range 前端傳入的 Range header，格式：bytes=起點-終點 或 bytes=起點-
      *              required=false 表示初次下載時不需要帶此 header
      */
-    @GetMapping("/api/pdf/{filename}")
+    @GetMapping(PROXY_PDF_PATH)
     public void proxyPdf(
             @PathVariable String filename,
-            @RequestHeader(value = "Range", required = false) String range,
+            @RequestHeader(value = HttpHeaders.RANGE, required = false) String range,
             HttpServletResponse response) throws IOException {
 
         if (filename.contains("..") || filename.contains("/") || filename.contains("\\")) {
@@ -88,18 +92,18 @@ public class PdfProxyController {
 
         if (range != null) {
             // 將前端的 Range 原樣轉發到 PDF Server，讓上游決定是否回傳 206 區段內容。
-            conn.setRequestProperty("Range", range);
+            conn.setRequestProperty(HttpHeaders.RANGE, range);
         }
 
         log.info("PROXY  → PdfSvr  | GET {} | Range: {}", url, range != null ? range : "(none)");
 
         int status = conn.getResponseCode();
         // Accept-Ranges（可接受的範圍）：伺服器可接受的 Range 單位（例如：bytes）。
-        String acceptRanges = conn.getHeaderField("Accept-Ranges");
+        String acceptRanges = conn.getHeaderField(HttpHeaders.ACCEPT_RANGES);
         // Content-Range（內容範圍）：本次回應內容在整體檔案中的位元組區間（例如：bytes 1000-1999/5000）。
-        String contentRange = conn.getHeaderField("Content-Range");
+        String contentRange = conn.getHeaderField(HttpHeaders.CONTENT_RANGE);
         // Content-Length（內容長度）：本次回應 body 的位元組長度（例如：1000）。
-        String contentLength = conn.getHeaderField("Content-Length");
+        String contentLength = conn.getHeaderField(HttpHeaders.CONTENT_LENGTH);
 
         log.info("PdfSvr → PROXY   | status={} | Content-Length: {} | Content-Range: {} | Accept-Ranges: {}",
                 status,
@@ -120,7 +124,7 @@ public class PdfProxyController {
         long elapsed = System.currentTimeMillis() - startTs;
         log.info("PROXY  → Browser | 寫入記憶體完成 | {} bytes | 耗時 {} ms", body.length, elapsed);
 
-        response.setContentType("application/pdf");
+        response.setContentType(MediaType.APPLICATION_PDF_VALUE);
 
         // 上游若忽略 Range 並回 200，代理端仍維持續傳語意：本地切片後回 206。
         if (range != null && status == HttpServletResponse.SC_OK) {
@@ -130,10 +134,10 @@ public class PdfProxyController {
                 log.warn("PROXY  → Browser | 416 Range Not Satisfiable | Range={} | total={}", range, body.length);
                 response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
                 // 告知客戶端伺服器支援 bytes，但本次請求無法滿足；*/total 表示可用總長度。
-                response.setHeader("Accept-Ranges", "bytes");
-                response.setHeader("Content-Range", "bytes */" + body.length);
+                response.setHeader(HttpHeaders.ACCEPT_RANGES, "bytes");
+                response.setHeader(HttpHeaders.CONTENT_RANGE, "bytes */" + body.length);
                 // 416 回應不回傳檔案內容，因此 body 長度為 0。
-                response.setHeader("Content-Length", "0");
+                response.setHeader(HttpHeaders.CONTENT_LENGTH, "0");
                 return;
             }
 
@@ -145,9 +149,9 @@ public class PdfProxyController {
             log.info("PROXY  → Browser | fallback 206 | bytes {}-{}/{} ({} bytes)", start, end, body.length, length);
             // 以 206 + Range 相關標頭回覆，維持前端續傳所需的 HTTP 語意。
             response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
-            response.setHeader("Accept-Ranges", "bytes");
-            response.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + body.length);
-            response.setHeader("Content-Length", String.valueOf(length));
+            response.setHeader(HttpHeaders.ACCEPT_RANGES, "bytes");
+            response.setHeader(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + body.length);
+            response.setHeader(HttpHeaders.CONTENT_LENGTH, String.valueOf(length));
             // 只寫出 body 指定區段（start 起算、共 length bytes）。
             response.getOutputStream().write(body, start, length);
             return;
@@ -156,18 +160,18 @@ public class PdfProxyController {
         response.setStatus(status);
         if (acceptRanges != null) {
             // 回傳上游的可續傳能力（通常是 bytes），讓前端知道可用 Range 續傳。
-            response.setHeader("Accept-Ranges", acceptRanges);
+            response.setHeader(HttpHeaders.ACCEPT_RANGES, acceptRanges);
         }
         if (contentRange != null) {
             // 續傳時把實際區段範圍透傳給前端（例如 bytes 1000-1999/5000）。
-            response.setHeader("Content-Range", contentRange);
+            response.setHeader(HttpHeaders.CONTENT_RANGE, contentRange);
         }
         if (contentLength != null) {
             // 透傳本次回應 body 長度；206 時是片段長度，200 時通常是整檔長度。
-            response.setHeader("Content-Length", contentLength);
+            response.setHeader(HttpHeaders.CONTENT_LENGTH, contentLength);
         }
 
-        response.setHeader("Content-Length", String.valueOf(body.length));
+        response.setHeader(HttpHeaders.CONTENT_LENGTH, String.valueOf(body.length));
         response.getOutputStream().write(body);
     }
 
@@ -211,7 +215,7 @@ public class PdfProxyController {
      * 列出 file-storage/ 目錄中所有 PDF 檔案（供前端顯示選單用）。
      * 回傳每個檔案的名稱與大小，前端用大小來計算 Range 的起訖位置。
      */
-    @GetMapping("/api/files")
+    @GetMapping(PROXY_FILES_PATH)
     public List<Map<String, Object>> listFiles() {
         log.info("Browser → PROXY   | GET /api/files");
         File dir = new File("file-storage");
